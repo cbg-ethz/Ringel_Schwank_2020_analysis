@@ -1,0 +1,153 @@
+---
+title: "Mututal Exclusivity"
+author: "Sumana Srivatsa"
+date: "9/13/2019"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=60),tidy=TRUE)
+
+```
+
+## Data preprocessing 
+
+The `runTimex` function processes the mutation and copy number data to build the alteration matrix for COAD and READ for MSS and MSI samples, respectively. Note that we run TiMEX in this function but it is a dummy run for convenience (helps combine the COAD and READ matrices in the next step).
+
+```{r preprocess}
+library(TiMEx)
+library(dplyr)
+library(biclust)
+
+CN_thresh <- 1
+types     <- c("COAD", "READ")  #"COAD" "READ"
+p_val_thr <- 0.1      
+
+runTimex <- function(type, p_val_thr = 0.05, ms_status){
+    # Load mutation data
+    load(paste("./Data/mutations_TCGA-",type, ".RData", sep =""))
+    # Load mss status
+    load(paste("./Data/TCGA-",type,"_msi_mss.rda", sep = ""))
+    # Read CNV data
+    all_CN_mat <- read.delim2(paste("./Data/TCGA-",type,"_Gistic2_CopyNumber.by_genes", sep =""),stringsAsFactors = FALSE)
+  
+    # Binarize the copy number matrix with values -2 or + 2 set to 1 and 0 otherwise 
+    all_CN_mat <- data.frame(all_CN_mat[,-1], row.names=all_CN_mat[,1])
+    all_CN_mat <- binarize(abs(all_CN_mat), threshold = CN_thresh)
+  
+    # Set of drivers and TGF regulators
+    drivers <- c("ARID1A", "ARID2", 
+                 "SMARCA4", "SMARCB1", 
+                 "CNIH4", "KEAP1", 
+                 "FAM122A", "NBAS", 
+                 "CDKN2A", "CDKN2B")
+    tgf_reg <- c("TGFBR1", "TGFBR2", 
+                 "SMAD4", "SMAD3")
+    
+    # Reformatting the colnames of mutation matrix to match with copy number data
+    patients   <- sapply(colnames(mut_data$missense),
+                         function(x){paste(strsplit(x,"[-]")[[1]][1:4],collapse = ".")})
+    patients   <- sapply(patients, function(x){substr(x, 1, nchar(x)-1)})
+    colnames(mut_data$missense)   <- patients
+    colnames(mut_data$truncating) <- patients
+    # Common samples between mutation and copy number data
+    patients   <- intersect(patients, colnames(all_CN_mat))
+  
+    # categorizing patients based on MSS or MSI status
+    if(ms_status == "MSS"){
+      ms_samples <- msires$bcr_patient_barcode[msires$mononucleotide_and_dinucleotide_marker_panel_analysis_status == ms_status] 
+    
+      # The sample barcodes are different between msires and patients, 
+      # need to convert them temporarily
+      temp_patients <- patients
+      temp_patients <- sapply(temp_patients,
+                              function(x){paste(strsplit(x,"[.]")[[1]][1:3],collapse = "-")})
+      patients      <- patients[which(temp_patients %in% ms_samples)]
+    }else if(ms_status == "MSI"){
+      ms_samples <- msires$bcr_patient_barcode[msires$mononucleotide_and_dinucleotide_marker_panel_analysis_status %in% c("MSI-H", "MSI-L", "MSI")] 
+      # The sample barcodes are different between msires and patients, 
+      # need to convert them temporarily
+      temp_patients <- patients
+      temp_patients <- sapply(temp_patients,
+                              function(x){paste(strsplit(x,"[.]")[[1]][1:3],collapse = "-")})
+      patients      <- patients[which(temp_patients %in% ms_samples)]
+    }else{
+      ms_samples <- NULL
+    }
+    cat("The number of samples with", ms_status, length(patients))
+    # Missense, truncated mutations and copy number for driver gene
+    # This step of initializing matrix of 0s is important as mutation informations vary for genes
+    miss_mat <- trun_mat <- CNA_mat <- matrix(0, nrow = length(c(drivers,tgf_reg)), ncol = length(patients))
+    all_genes <- c(drivers,tgf_reg)
+    dimnames(miss_mat)   <- list(all_genes,patients)
+    dimnames(trun_mat)   <- list(all_genes,patients)
+    dimnames(CNA_mat)    <- list(all_genes,patients)
+    
+    # For the missense mutations
+    miss_mat[intersect(all_genes, rownames(mut_data$missense)), patients]    <- mut_data$missense[intersect(all_genes, rownames(mut_data$missense)),patients]
+    # For the truncated mutations
+    trun_mat[intersect(all_genes, rownames(mut_data$truncating)), patients]  <- mut_data$truncating[intersect(all_genes, rownames(mut_data$truncating)),patients]
+    # For copy number data
+    CNA_mat[intersect(all_genes, rownames(all_CN_mat)), patients]            <- as.matrix(all_CN_mat[intersect(all_genes, rownames(all_CN_mat)),patients])
+  
+    # Binarizing matrix for TiMEx mut_mat without CNA and comb_alterations is with CNA
+    mut_mat          <- binarize(miss_mat + trun_mat, 0)
+    comb_alterations <- t(binarize(miss_mat + trun_mat + CNA_mat, 0))
+    rownames(mut_mat)<- paste(rownames(mut_mat),"mut",sep="_")
+    rownames(CNA_mat)<- paste(rownames(CNA_mat),"CNA",sep="_")
+    all_alterations  <- cbind(t(mut_mat),t(CNA_mat))  
+    
+    # Dummy runs of TiMEx with CNA and mutations separate and combined
+    result_all      <- TiMEx(all_alterations, pairPvalue = p_val_thr)
+    result_comb     <- TiMEx(comb_alterations, pairPvalue = p_val_thr)
+  
+  return(list(all = result_all, comb = result_comb))
+}
+
+
+```
+
+## TiMEx Run
+
+Next for each category of MS (MSI, MSS or none), we run the `runTimex` function for COAD and READ samples. We can either use combined mutation matrix where a gene in a sample has a value of 1 if it is subject to non-synonymous mutations and/or CNA, or we can use mutation matrix where a gene in a given sample has two disctinct entries, i.e, CNA and non-synonymous mutations are treated separately. Nex run TiMEx for each of these mutation matrices at FDR = 10%. 
+
+```{r Timex}
+path2res <- "~/Downloads/"
+
+ms_types <- c("MSS","MSI","None")
+
+for(ms_status in ms_types){
+  # Execute the  runTimex function before this step
+  result              <- sapply(types, 
+                                runTimex, 
+                                p_val_thr = p_val_thr, 
+                                ms_status = ms_status, 
+                                simplify = F)
+  
+  # Combining matrices for COAD and READ before running TiMEx
+  # All: gene_mut and gene_CNA are treated differently
+  # Comb: mutations and CNA of a gene are combined as single alterations
+  comb_alterations    <- do.call(rbind, sapply(result, function(x){x$comb$matrix}))
+  all_alterations     <- do.call(rbind, sapply(result, function(x){x$all$matrix}))
+  fin_result_comb     <- TiMEx(comb_alterations, pairPvalue = p_val_thr)
+  fin_result_all      <- TiMEx(all_alterations, pairPvalue = p_val_thr)
+  
+  cat("Total number of samples with", ms_status, dim(all_alterations)[1],"\n")
+  cat("Total number of samples with", ms_status, dim(comb_alterations)[1],"\n")
+  
+  # Writing results of combined alterations
+  temp_comb <- cbind.data.frame(fin_result_comb$genesSignif[[2]]$fdr,
+                                fin_result_comb$pvals[[2]]$fdr)
+  colnames(temp_comb) <- c("GeneA", "GeneB","adj_pval")
+  write.table(temp_comb, paste(path2res, "COADREAD_CNA_comb", "_", ms_status, "_", p_val_thr, "_TiMEx.txt", sep = ""),quote = F, sep = "\t", row.names = F, col.names = T)
+  
+  # Writing results of 'all' alterations
+  temp_all <- cbind.data.frame(fin_result_all$genesSignif[[2]]$fdr,
+                               fin_result_all$pvals[[2]]$fdr)
+  colnames(temp_all) <- c("GeneA", "GeneB","adj_pval")
+  write.table(temp_all, paste(path2res, "COADREAD_CNA_all", "_", ms_status, "_", p_val_thr, "_TiMEx.txt", sep = ""),quote = F, sep = "\t", row.names = F, col.names = T)
+}
+
+```
